@@ -100,6 +100,11 @@ type Serf struct {
 	snapshotter *Snapshotter
 	keyManager  *KeyManager
 
+	// eventManager fans member and user events out to acknowledge-based
+	// Subscriptions created via Serf.Subscribe. It is independent of the
+	// legacy fire-and-forget EventCh.
+	eventManager *eventManager
+
 	coordClient    *coordinate.Client
 	coordCache     map[string]*coordinate.Coordinate
 	coordCacheLock sync.RWMutex
@@ -409,6 +414,12 @@ func Create(conf *Config) (*Serf, error) {
 	}
 
 	conf.MemberlistConfig.MetricLabels = conf.MetricLabels
+
+	// Create the subscription event manager before memberlist: memberlist
+	// synchronously delivers the local node's join event during Create, and
+	// every member event path fans out through this manager. It starts no
+	// goroutines of its own; fan-out happens on the existing event paths.
+	serf.eventManager = newEventManager(serf.snapshotMembers)
 
 	// Create the underlying memberlist that will manage membership
 	// and failure detection for the Serf instance.
@@ -803,6 +814,42 @@ func (s *Serf) Members() []Member {
 	return members
 }
 
+// snapshotMembers returns a point-in-time copy of the current members.
+// It is the snapshot source for subscription resynchronization and takes
+// the member read lock the same way Members does.
+func (s *Serf) snapshotMembers() []Member {
+	s.memberLock.RLock()
+	defer s.memberLock.RUnlock()
+
+	members := make([]Member, 0, len(s.members))
+	for _, m := range s.members {
+		members = append(members, m.Member)
+	}
+	return members
+}
+
+// Subscribe opens a new event subscription with acknowledgement semantics.
+//
+// The subscription begins with a consistent point-in-time member snapshot,
+// followed by incremental member and user events. Within each of the two
+// streams (member events and user events) ordering is preserved; the
+// streams are never merged or reordered relative to one another.
+//
+// Events are buffered per stream and per subscription, and a batch is only
+// discarded after it has been acknowledged (implicitly when a configured
+// handler returns nil, or explicitly through Subscription.Ack). A handler
+// failure redelivers the same batch, so no event is skipped because of a
+// slow or failing consumer. If a stream buffer reaches its limit the
+// member stream is resynchronized through a fresh member snapshot, while
+// the user stream delivers an explicit truncation batch, since user
+// events cannot be reconstructed.
+//
+// The returned Subscription must be released with Unsubscribe (it is also
+// torn down automatically on Serf.Shutdown).
+func (s *Serf) Subscribe(conf SubscribeConfig) *Subscription {
+	return s.eventManager.subscribe(conf)
+}
+
 // RemoveFailedNode is a backwards compatible form
 // of forceleave
 func (s *Serf) RemoveFailedNode(node string) error {
@@ -880,6 +927,10 @@ func (s *Serf) Shutdown() error {
 	}
 	close(s.shutdownCh)
 
+	// Release every acknowledge-based subscription and wake any
+	// goroutine blocked waiting for its next batch.
+	s.eventManager.close()
+
 	// Wait for the snapshoter to finish if we have one
 	if s.snapshotter != nil {
 		s.snapshotter.Wait()
@@ -920,6 +971,18 @@ func (s *Serf) broadcast(t messageType, msg any, notify chan<- struct{}) error {
 		notify: notify,
 	})
 	return nil
+}
+
+// publishMemberEvent delivers a member event to the legacy fire-and-forget
+// EventCh and fans it out to every acknowledge-based subscription. The
+// subscription path never blocks Serf state updates: each subscription
+// buffers the event or truncates its own view. Callers must hold the
+// member lock.
+func (s *Serf) publishMemberEvent(event MemberEvent) {
+	if s.config.EventCh != nil {
+		s.config.EventCh <- event
+	}
+	s.eventManager.publishMember(event)
 }
 
 // handleNodeJoin is called when a node join event is received
@@ -994,12 +1057,10 @@ func (s *Serf) handleNodeJoin(n *memberlist.Node) {
 	// Send an event along
 	s.logger.Printf("[INFO] serf: EventMemberJoin: %s %s",
 		member.Name, member.Addr)
-	if s.config.EventCh != nil {
-		s.config.EventCh <- MemberEvent{
-			Type:    EventMemberJoin,
-			Members: []Member{member.Member},
-		}
-	}
+	s.publishMemberEvent(MemberEvent{
+		Type:    EventMemberJoin,
+		Members: []Member{member.Member},
+	})
 }
 
 // handleNodeLeave is called when a node leave event is received
@@ -1043,12 +1104,10 @@ func (s *Serf) handleNodeLeave(n *memberlist.Node) {
 
 	s.logger.Printf("[INFO] serf: %s: %s %s",
 		eventStr, member.Name, member.Addr)
-	if s.config.EventCh != nil {
-		s.config.EventCh <- MemberEvent{
-			Type:    event,
-			Members: []Member{member.Member},
-		}
-	}
+	s.publishMemberEvent(MemberEvent{
+		Type:    event,
+		Members: []Member{member.Member},
+	})
 }
 
 // handleNodeUpdate is called when a node meta data update
@@ -1087,12 +1146,10 @@ func (s *Serf) handleNodeUpdate(n *memberlist.Node) {
 
 	// Send an event along
 	s.logger.Printf("[INFO] serf: EventMemberUpdate: %s", member.Name)
-	if s.config.EventCh != nil {
-		s.config.EventCh <- MemberEvent{
-			Type:    EventMemberUpdate,
-			Members: []Member{member.Member},
-		}
-	}
+	s.publishMemberEvent(MemberEvent{
+		Type:    EventMemberUpdate,
+		Members: []Member{member.Member},
+	})
 }
 
 // handleNodeLeaveIntent is called when an intent to leave is received.
@@ -1165,12 +1222,10 @@ func (s *Serf) handleNodeLeaveIntent(leaveMsg *messageLeave) bool {
 		// graceful leave.
 		s.logger.Printf("[INFO] serf: EventMemberLeave (forced): %s %s",
 			member.Name, member.Addr)
-		if s.config.EventCh != nil {
-			s.config.EventCh <- MemberEvent{
-				Type:    EventMemberLeave,
-				Members: []Member{member.Member},
-			}
-		}
+		s.publishMemberEvent(MemberEvent{
+			Type:    EventMemberLeave,
+			Members: []Member{member.Member},
+		})
 
 		if leaveMsg.Prune {
 			s.handlePrune(member)
@@ -1301,14 +1356,16 @@ func (s *Serf) handleUserEvent(eventMsg *messageUserEvent) bool {
 	metrics.IncrCounterWithLabels([]string{"serf", "events"}, 1, s.metricLabels)
 	metrics.IncrCounterWithLabels([]string{"serf", "events", eventMsg.Name}, 1, s.metricLabels)
 
-	if s.config.EventCh != nil {
-		s.config.EventCh <- UserEvent{
-			LTime:    eventMsg.LTime,
-			Name:     eventMsg.Name,
-			Payload:  eventMsg.Payload,
-			Coalesce: eventMsg.CC,
-		}
+	userEventOut := UserEvent{
+		LTime:    eventMsg.LTime,
+		Name:     eventMsg.Name,
+		Payload:  eventMsg.Payload,
+		Coalesce: eventMsg.CC,
 	}
+	if s.config.EventCh != nil {
+		s.config.EventCh <- userEventOut
+	}
+	s.eventManager.publishUser(userEventOut)
 	return true
 }
 
@@ -1556,12 +1613,10 @@ func (s *Serf) eraseNode(m *memberState) {
 	}
 
 	// Send an event along
-	if s.config.EventCh != nil {
-		s.config.EventCh <- MemberEvent{
-			Type:    EventMemberReap,
-			Members: []Member{m.Member},
-		}
-	}
+	s.publishMemberEvent(MemberEvent{
+		Type:    EventMemberReap,
+		Members: []Member{m.Member},
+	})
 }
 
 // handleReap periodically reaps the list of failed and left members, as well
