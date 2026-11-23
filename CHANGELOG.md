@@ -2,6 +2,7 @@
 
 IMPROVEMENTS:
 * ValidateNodeName flag can now restrict node names to alphanumeric, -, and . while also keeping node names under 128 characters. Verification of IP Address and tags occur for messages. [GH-612](https://github.com/hashicorp/serf/pull/612)
+* library: `Join` now attempts each seed independently and returns the number of nodes actually joined together with an error summarizing any per-seed failures, so a partial success is no longer indistinguishable from a total failure. Successful merges are kept when other seeds fail. Retrying the same seeds is idempotent (no duplicate handshakes or join events), and a new `JoinWithContext` plus `Config.JoinTimeout` stop new handshakes once the deadline expires while letting in-flight connections converge. Error summaries redact any credentials embedded in seed addresses.
 
 ## 0.8.4 (September 19, 2019)
 

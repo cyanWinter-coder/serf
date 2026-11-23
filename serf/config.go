@@ -59,6 +59,14 @@ type Config struct {
 	// set, a timeout of 5 seconds will be set.
 	BroadcastTimeout time.Duration
 
+	// JoinTimeout is the maximum amount of time a Join call spends
+	// attempting the whole batch of seed nodes. Once it elapses, no new
+	// seed handshakes are started, while a handshake already in flight is
+	// allowed to converge. A zero value disables the overall deadline;
+	// individual handshakes are still bounded by the memberlist
+	// TCPTimeout.
+	JoinTimeout time.Duration
+
 	// LeavePropagateDelay is for our leave (node dead) message to propagate
 	// through the cluster. In particular, we want to stay up long enough to
 	// service any probes from other nodes before they learn about us

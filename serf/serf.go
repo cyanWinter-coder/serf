@@ -5,8 +5,10 @@ package serf
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"math/rand"
@@ -15,6 +17,7 @@ import (
 	"regexp"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -45,6 +48,13 @@ var (
 	// FeatureNotSupported is returned if a feature cannot be used
 	// due to an older protocol version being used.
 	FeatureNotSupported = fmt.Errorf("Feature not supported") //nolint:staticcheck
+
+	// credentialPattern matches a "user:password@" userinfo component, with
+	// or without an RFC 3986 scheme prefix. DNS resolution failures can
+	// surface the userinfo without the scheme, so matching cannot rely on
+	// "://" being present. The credentials are replaced while any scheme
+	// prefix is preserved.
+	credentialPattern = regexp.MustCompile(`([a-zA-Z][a-zA-Z0-9+.\-]*://)?[^/@\s:]+:[^/@\s]+@`)
 )
 
 // ReconnectTimeoutOverrider is an interface that can be implemented to allow overriding
@@ -78,6 +88,11 @@ type Serf struct {
 	// indexed by node, and always store the latest lamport time / intent
 	// we've seen. The memberLock protects this structure.
 	recentIntents map[string]nodeIntent
+
+	// joinBroadcasted records whether this node has already broadcast its
+	// join intent, so that retrying a join never publishes a duplicate
+	// join event. The joinLock protects this field.
+	joinBroadcasted bool
 
 	eventBroadcasts *memberlist.TransmitLimitedQueue
 	eventBuffer     []*userEvents
@@ -632,13 +647,41 @@ func (s *Serf) SetTags(tags map[string]string) error {
 // successfully contacted. The returned error will be non-nil only in the
 // case that no nodes could be contacted. If ignoreOld is true, then any
 // user messages sent prior to the join will be ignored.
+//
+// Each seed is attempted independently: a successful merge with one seed
+// is never rolled back because another seed timed out or failed, and the
+// returned error, if any, summarizes every failed attempt without
+// exposing authentication material. Retrying Join with the same seeds is
+// idempotent: seeds that were already contacted successfully are not
+// re-attempted and the join intent is only broadcast once.
 func (s *Serf) Join(existing []string, ignoreOld bool) (int, error) {
+	ctx := context.Background()
+	if s.config.JoinTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, s.config.JoinTimeout)
+		defer cancel()
+	}
+	return s.JoinWithContext(ctx, existing, ignoreOld)
+}
+
+// JoinWithContext behaves like Join but bounds the whole batch of seed
+// attempts with ctx. Once ctx is done, no new seed handshakes are started;
+// a handshake that is already in flight is allowed to converge rather than
+// being interrupted. A per-seed timeout still applies via the memberlist
+// TCP timeout regardless of ctx.
+func (s *Serf) JoinWithContext(ctx context.Context, existing []string, ignoreOld bool) (int, error) {
+	// A nil context would panic on ctx.Err below; treat it as no deadline.
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
 	// Do a quick state check
 	if s.State() != SerfAlive {
 		return 0, fmt.Errorf("Serf can't Join after Leave or Shutdown")
 	}
 
-	// Hold the joinLock, this is to make eventJoinIgnore safe
+	// Hold the joinLock, this is to make eventJoinIgnore safe and to
+	// serialize joins so the joined-seed bookkeeping stays consistent.
 	s.joinLock.Lock()
 	defer s.joinLock.Unlock()
 
@@ -651,18 +694,151 @@ func (s *Serf) Join(existing []string, ignoreOld bool) (int, error) {
 		}()
 	}
 
-	// Have memberlist attempt to join
-	num, err := s.memberlist.Join(existing)
+	// De-duplicate the batch itself while preserving its order, so a seed
+	// listed more than once is only attempted once.
+	seeds := dedupeSeeds(existing)
 
-	// If we joined any nodes, broadcast the join message
-	if num > 0 {
-		// Start broadcasting the update
-		if err := s.broadcastJoin(s.clock.Time()); err != nil {
-			return num, err
+	// Snapshot the members that are already alive before this call, so a
+	// retry never re-attempts a handshake against a seed that is part of
+	// the current membership. Nodes which have since left are absent and
+	// can be rejoined. The local node is excluded: a seed may legitimately
+	// reuse our name (memberlist resolves the conflict).
+	alreadyJoined := s.aliveMemberNames()
+	delete(alreadyJoined, s.config.NodeName)
+
+	var (
+		numSuccess int
+		joinErrs   []error
+		timedOut   bool
+	)
+	for _, seed := range seeds {
+		// Skip seeds pointing at a node we already have as an alive member,
+		// so retrying the same batch doesn't repeat handshakes.
+		if name := seedNodeName(seed); name != "" {
+			if _, ok := alreadyJoined[name]; ok {
+				continue
+			}
 		}
+
+		// Once the context is done, stop starting new handshakes but let
+		// any in-flight attempt (the one memberlist is executing below)
+		// run to completion.
+		if err := ctx.Err(); err != nil {
+			timedOut = true
+			joinErrs = append(joinErrs, fmt.Errorf("join canceled before contacting %s: %w",
+				sanitizeSeed(seed), err))
+			continue
+		}
+
+		// Attempt this seed on its own so its result is independent of the
+		// other seeds in the batch.
+		num, err := s.memberlist.Join([]string{seed})
+		if err != nil {
+			joinErrs = append(joinErrs, fmt.Errorf("failed to join %s: %w",
+				sanitizeSeed(seed), sanitizeJoinError(err)))
+			continue
+		}
+
+		numSuccess += num
 	}
 
-	return num, err
+	// If we joined any nodes and haven't broadcast our join intent yet, do
+	// so exactly once. Successful merges from earlier seeds stay in effect
+	// regardless of later failures.
+	if numSuccess > 0 && !s.joinBroadcasted {
+		if err := s.broadcastJoin(s.clock.Time()); err != nil {
+			return numSuccess, err
+		}
+		s.joinBroadcasted = true
+	}
+
+	// Partial success is still a success as far as the return value goes,
+	// but surface the per-seed failures so callers can see the real
+	// membership boundary. A fully failed join returns an error as before.
+	if len(joinErrs) == 0 {
+		return numSuccess, nil
+	}
+	joined := errors.Join(joinErrs...)
+	if numSuccess == 0 {
+		if timedOut {
+			return 0, fmt.Errorf("no nodes could be joined: %w", joined)
+		}
+		return 0, joined
+	}
+	return numSuccess, fmt.Errorf("partial join: %d node(s) joined, %d seed(s) failed: %w",
+		numSuccess, len(joinErrs), joined)
+}
+
+// dedupeSeeds returns seeds with duplicates removed, preserving first-seen
+// order.
+func dedupeSeeds(seeds []string) []string {
+	seen := make(map[string]struct{}, len(seeds))
+	out := make([]string, 0, len(seeds))
+	for _, seed := range seeds {
+		if _, ok := seen[seed]; ok {
+			continue
+		}
+		seen[seed] = struct{}{}
+		out = append(out, seed)
+	}
+	return out
+}
+
+// aliveMemberNames returns the set of names of members memberlist currently
+// considers alive (including the local node).
+func (s *Serf) aliveMemberNames() map[string]struct{} {
+	out := make(map[string]struct{})
+	for _, n := range s.memberlist.Members() {
+		if n.State == memberlist.StateAlive || n.State == memberlist.StateSuspect {
+			out[n.Name] = struct{}{}
+		}
+	}
+	return out
+}
+
+// seedNodeName extracts the optional "node-name/" prefix from a seed
+// address. It returns an empty string when the seed only contains a
+// host:port.
+func seedNodeName(seed string) string {
+	if idx := strings.Index(seed, "/"); idx > 0 {
+		return seed[:idx]
+	}
+	return ""
+}
+
+// sanitizeSeed strips any embedded credentials (for example a userinfo
+// component in a URL-style seed) so error summaries never leak secrets.
+func sanitizeSeed(seed string) string {
+	at := strings.LastIndex(seed, "@")
+	if at < 0 {
+		return seed
+	}
+	// Only treat it as credentials when there is a scheme separator before
+	// the "@", otherwise a bare host containing "@" is passed through.
+	scheme := strings.Index(seed, "://")
+	if scheme < 0 || scheme > at {
+		return seed
+	}
+	return seed[:scheme+3] + "***" + seed[at:]
+}
+
+// sanitizeJoinError removes any credentials embedded in the text of an
+// error returned by memberlist. Memberlist errors normally only mention
+// host:port pairs, but seed strings are propagated through some error
+// paths, so we scrub them defensively.
+func sanitizeJoinError(err error) error {
+	if err == nil {
+		return nil
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "@") {
+		return err
+	}
+	redacted := credentialPattern.ReplaceAllString(msg, "${1}***@")
+	if redacted == msg {
+		return err
+	}
+	return errors.New(redacted)
 }
 
 // broadcastJoin broadcasts a new join intent with a
