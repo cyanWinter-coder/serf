@@ -6,6 +6,7 @@ package serf
 import (
 	"bytes"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -3070,4 +3071,272 @@ func TestSerf_perNodeReconnectTimeout(t *testing.T) {
 	if !override.called {
 		t.Fatalf("The reconnect override was not used")
 	}
+}
+
+// TestSerf_ShutdownIdempotent verifies repeated Shutdown calls all return the
+// same result and leave the instance in a consistent shutdown state.
+func TestSerf_ShutdownIdempotent(t *testing.T) {
+	ip, returnFn := testutil.TakeIP()
+	defer returnFn()
+
+	s, err := Create(testConfig(t, ip))
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	const callers = 8
+	errs := make([]error, callers)
+	var wg sync.WaitGroup
+	for i := range callers {
+		wg.Go(func() {
+			errs[i] = s.Shutdown()
+		})
+	}
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("shutdown caller %d got error: %v", i, err)
+		}
+	}
+	if s.State() != SerfShutdown {
+		t.Fatalf("bad state: %d", s.State())
+	}
+	select {
+	case <-s.ShutdownCh():
+	default:
+		t.Fatalf("shutdown channel must be closed")
+	}
+
+	// A further sequential call must still report the same nil result.
+	if err := s.Shutdown(); err != nil {
+		t.Fatalf("repeat shutdown returned error: %v", err)
+	}
+}
+
+// TestSerf_RejectConfigChangesAfterShutdown ensures the shutdown entry point
+// freezes the visible configuration: once shutdown begins every
+// cluster-changing operation is rejected instead of racing the final commit.
+func TestSerf_RejectConfigChangesAfterShutdown(t *testing.T) {
+	ip, returnFn := testutil.TakeIP()
+	defer returnFn()
+
+	s, err := Create(testConfig(t, ip))
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	if err := s.Shutdown(); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	if _, err := s.Join([]string{"127.0.0.1:1"}, false); err == nil {
+		t.Fatalf("Join after shutdown must fail")
+	}
+	if err := s.SetTags(map[string]string{"role": "late"}); err == nil {
+		t.Fatalf("SetTags after shutdown must fail")
+	}
+	if err := s.RemoveFailedNode("nobody"); err == nil {
+		t.Fatalf("RemoveFailedNode after shutdown must fail")
+	}
+	if err := s.Leave(); err == nil {
+		t.Fatalf("Leave after shutdown must fail")
+	}
+}
+
+// TestSerf_ConcurrentLeaveAndShutdown hammers Leave and Shutdown together.
+// The hard requirement is that memberlist.Leave never runs after
+// memberlist.Shutdown, which historically panicked with
+// "leave after shutdown".
+func TestSerf_ConcurrentLeaveAndShutdown(t *testing.T) {
+	for iter := range 12 {
+		ip, returnFn := testutil.TakeIP()
+		s, err := Create(testConfig(t, ip))
+		if err != nil {
+			returnFn()
+			t.Fatalf("iter %d err: %v", iter, err)
+		}
+
+		var wg sync.WaitGroup
+		wg.Go(func() {
+			_ = s.Leave()
+		})
+		wg.Go(func() {
+			_ = s.Shutdown()
+		})
+		wg.Wait()
+		returnFn()
+	}
+}
+
+// TestSerf_ShutdownPinnedSnapshot drives a full shutdown with a snapshot and
+// verifies the on-disk file is a versioned snapshot containing exactly the
+// alive members visible at shutdown, recoverable into a new instance.
+func TestSerf_ShutdownPinnedSnapshot(t *testing.T) {
+	td := t.TempDir()
+
+	ip1, returnFn1 := testutil.TakeIP()
+	defer returnFn1()
+	ip2, returnFn2 := testutil.TakeIP()
+	defer returnFn2()
+
+	s1Config := testConfig(t, ip1)
+	s2Config := testConfig(t, ip2)
+	s2Config.SnapshotPath = filepath.Join(td, "snap")
+
+	s1, err := Create(s1Config)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	defer s1.Shutdown()
+
+	s2, err := Create(s2Config)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	waitUntilNumNodes(t, 1, s1, s2)
+	if _, err := s1.Join([]string{s2Config.NodeName + "/" + s2Config.MemberlistConfig.BindAddr}, false); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	waitUntilNumNodes(t, 2, s1, s2)
+	testutil.Yield()
+
+	// Plain shutdown (no leave): the alive member set must be committed.
+	if err := s2.Shutdown(); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	contents, err := os.ReadFile(s2Config.SnapshotPath)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if !strings.HasPrefix(string(contents), snapshotHeader) {
+		t.Fatalf("committed snapshot missing version header: %q", string(contents))
+	}
+	if !strings.Contains(string(contents), "alive:") {
+		t.Fatalf("committed snapshot lost alive members: %q", string(contents))
+	}
+	if strings.Contains(string(contents), tmpExt) || fileExists(s2Config.SnapshotPath+tmpExt) {
+		t.Fatalf("temporary compaction file must not remain")
+	}
+
+	// Recovery must rebuild both known nodes from the committed file.
+	s2Config = testConfig(t, ip2)
+	s2Config.SnapshotPath = filepath.Join(td, "snap")
+	s2Restart, err := Create(s2Config)
+	if err != nil {
+		t.Fatalf("recovery failed: %v", err)
+	}
+	defer s2Restart.Shutdown()
+
+	retry.Run(t, func(r *retry.R) {
+		testMember(r, s2Restart.Members(), s1Config.NodeName, StatusAlive)
+	})
+}
+
+// TestSerf_CorruptSnapshotFailsStartup writes an unreadable versioned
+// snapshot and asserts Create fails rather than silently starting an empty
+// cluster.
+func TestSerf_CorruptSnapshotFailsStartup(t *testing.T) {
+	td := t.TempDir()
+
+	corrupt := strings.Join([]string{
+		strings.TrimSpace(snapshotHeader),
+		"clock: not-a-number",
+		"",
+	}, "\n")
+	snapPath := filepath.Join(td, "snap")
+	if err := os.WriteFile(snapPath, []byte(corrupt), 0644); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	ip, returnFn := testutil.TakeIP()
+	defer returnFn()
+
+	config := testConfig(t, ip)
+	config.SnapshotPath = snapPath
+	s, err := Create(config)
+	if err == nil {
+		s.Shutdown()
+		t.Fatalf("Create with corrupt snapshot must fail, got a live Serf")
+	}
+	if !errors.Is(err, errSnapshotCorrupt) {
+		t.Fatalf("expected errSnapshotCorrupt, got: %v", err)
+	}
+
+	// The corrupt file must remain on disk for operator inspection.
+	if _, err := os.Stat(snapPath); err != nil {
+		t.Fatalf("corrupt snapshot removed: %v", err)
+	}
+}
+
+// TestSerf_LeaveThenShutdownCommitOnce verifies that a graceful leave followed
+// by shutdown writes exactly one leave marker and the restarted node does not
+// re-join, while the snapshot file stays a valid versioned snapshot.
+func TestSerf_LeaveThenShutdownCommitOnce(t *testing.T) {
+	td := t.TempDir()
+
+	ip1, returnFn1 := testutil.TakeIP()
+	defer returnFn1()
+	ip2, returnFn2 := testutil.TakeIP()
+	defer returnFn2()
+
+	s1Config := testConfig(t, ip1)
+	s2Config := testConfig(t, ip2)
+	s2Config.SnapshotPath = filepath.Join(td, "snap")
+
+	s1, err := Create(s1Config)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	defer s1.Shutdown()
+
+	s2, err := Create(s2Config)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	waitUntilNumNodes(t, 1, s1, s2)
+	if _, err := s1.Join([]string{s2Config.NodeName + "/" + s2Config.MemberlistConfig.BindAddr}, false); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	waitUntilNumNodes(t, 2, s1, s2)
+
+	if err := s2.Leave(); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if err := s2.Shutdown(); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	contents, err := os.ReadFile(s2Config.SnapshotPath)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if !strings.HasPrefix(string(contents), snapshotHeader) {
+		t.Fatalf("leave snapshot missing version header: %q", string(contents))
+	}
+	if got := strings.Count(string(contents), "\nleave\n"); got != 1 {
+		t.Fatalf("expected one leave marker, got %d: %q", got, string(contents))
+	}
+
+	// Restart: the leave marker must keep the node isolated.
+	s2Config = testConfig(t, ip2)
+	s2Config.SnapshotPath = filepath.Join(td, "snap")
+	s2Restart, err := Create(s2Config)
+	if err != nil {
+		t.Fatalf("recovery failed: %v", err)
+	}
+	defer s2Restart.Shutdown()
+
+	if got := s2Restart.NumNodes(); got != 1 {
+		t.Fatalf("left node restarted into a cluster of %d members", got)
+	}
+}
+
+// fileExists reports whether the named path exists.
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
 }

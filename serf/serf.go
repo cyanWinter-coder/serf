@@ -97,6 +97,10 @@ type Serf struct {
 	state      SerfState
 	shutdownCh chan struct{}
 
+	// shutdownErr records the result of the first Shutdown so repeated calls
+	// return the same error instead of a misleading nil.
+	shutdownErr error
+
 	snapshotter *Snapshotter
 	keyManager  *KeyManager
 
@@ -335,9 +339,14 @@ func Create(conf *Config) (*Serf, error) {
 			conf.EventCh,
 			serf.shutdownCh)
 		if err != nil {
-			return nil, fmt.Errorf("Failed to setup snapshot: %v", err)
+			return nil, fmt.Errorf("Failed to setup snapshot: %w", err)
 		}
 		snap.metricLabels = serf.metricLabels
+		// Let the snapshotter record member generations from the live
+		// member table, and pin that table into the final shutdown commit
+		// so no event arriving after shutdown can change what is written.
+		snap.memberGeneration = serf.snapshotMemberGeneration
+		snap.memberSnap = serf.snapshotPinnedMembers
 		serf.snapshotter = snap
 		conf.EventCh = eventCh
 		prev = snap.AliveNodes()
@@ -611,10 +620,25 @@ func (s *Serf) registerQueryResponse(timeout time.Duration, resp *QueryResponse)
 	})
 }
 
+// requireAlive rejects any cluster-changing operation once the node is
+// leaving, has left, or is shutting down. It is the single gate that keeps
+// configuration changes out of the shutdown sequence so the final snapshot
+// commit can never race a new join, leave or tag update.
+func (s *Serf) requireAlive(op string) error {
+	if state := s.State(); state != SerfAlive {
+		return fmt.Errorf("Serf can't %s after Leave or Shutdown (state: %s)", op, state)
+	}
+	return nil
+}
+
 // SetTags is used to dynamically update the tags associated with
 // the local node. This will propagate the change to the rest of
 // the cluster. Blocks until a the message is broadcast out.
 func (s *Serf) SetTags(tags map[string]string) error {
+	if err := s.requireAlive("SetTags"); err != nil {
+		return err
+	}
+
 	// Check that the meta data length is okay
 	if len(s.encodeTags(tags)) > memberlist.MetaMaxSize {
 		return fmt.Errorf("Encoded length of tags exceeds limit of %d bytes",
@@ -634,8 +658,8 @@ func (s *Serf) SetTags(tags map[string]string) error {
 // user messages sent prior to the join will be ignored.
 func (s *Serf) Join(existing []string, ignoreOld bool) (int, error) {
 	// Do a quick state check
-	if s.State() != SerfAlive {
-		return 0, fmt.Errorf("Serf can't Join after Leave or Shutdown")
+	if err := s.requireAlive("Join"); err != nil {
+		return 0, err
 	}
 
 	// Hold the joinLock, this is to make eventJoinIgnore safe
@@ -692,23 +716,22 @@ func (s *Serf) broadcastJoin(ltime LamportTime) error {
 // times.
 // If the Leave broadcast timeout, Leave() will try to finish the sequence as best effort.
 func (s *Serf) Leave() error {
-	// Check the current state
+	// Hold the state lock for the entire sequence. Without this, Shutdown
+	// could run between the state check and the memberlist call below and
+	// make memberlist.Leave panic with "leave after shutdown".
 	s.stateLock.Lock()
+	defer s.stateLock.Unlock()
 
 	switch s.state {
 	case SerfLeft:
-		s.stateLock.Unlock()
 		return nil
 	case SerfLeaving:
-		s.stateLock.Unlock()
 		return fmt.Errorf("Leave already in progress")
 	case SerfShutdown:
-		s.stateLock.Unlock()
 		return fmt.Errorf("Leave called after Shutdown")
 	}
 
 	s.state = SerfLeaving
-	s.stateLock.Unlock()
 
 	// If we have a snapshot, mark we are leaving
 	if s.snapshotter != nil {
@@ -722,8 +745,11 @@ func (s *Serf) Leave() error {
 	}
 	s.clock.Increment()
 
-	// Process the leave locally
-	s.handleNodeLeaveIntent(&msg)
+	// Process the leave locally. We already hold stateLock, so read the
+	// state field directly instead of calling State() which would deadlock
+	// on the non-reentrant mutex.
+	leaveState := s.state
+	s.handleNodeLeaveIntentWithState(&msg, leaveState)
 
 	// Only broadcast the leave message if there is at least one
 	// other node alive.
@@ -754,11 +780,9 @@ func (s *Serf) Leave() error {
 	time.Sleep(s.config.LeavePropagateDelay)
 
 	// Transition to Left only if we not already shutdown
-	s.stateLock.Lock()
 	if s.state != SerfShutdown {
 		s.state = SerfLeft
 	}
-	s.stateLock.Unlock()
 	return nil
 }
 
@@ -803,6 +827,42 @@ func (s *Serf) Members() []Member {
 	return members
 }
 
+// snapshotMemberGeneration returns the member generation (the Lamport time
+// of the node's latest join/leave intent) for a node, used by the
+// snapshotter to label alive entries with their incarnation.
+func (s *Serf) snapshotMemberGeneration(name string) (LamportTime, bool) {
+	s.memberLock.RLock()
+	defer s.memberLock.RUnlock()
+
+	m, ok := s.members[name]
+	if !ok {
+		return 0, false
+	}
+	return m.statusLTime, true
+}
+
+// snapshotPinnedMembers returns the immutable member set captured for the
+// final shutdown commit. Only members that were still alive at shutdown are
+// worth re-joining, and the generation lets recovery discard stale entries.
+func (s *Serf) snapshotPinnedMembers() []pinnedMember {
+	s.memberLock.RLock()
+	defer s.memberLock.RUnlock()
+
+	pinned := make([]pinnedMember, 0, len(s.members))
+	for name, m := range s.members {
+		if m.Status != StatusAlive {
+			continue
+		}
+		addr := net.TCPAddr{IP: m.Addr, Port: int(m.Port)}
+		pinned = append(pinned, pinnedMember{
+			Name:       name,
+			Addr:       addr.String(),
+			Generation: m.statusLTime,
+		})
+	}
+	return pinned
+}
+
 // RemoveFailedNode is a backwards compatible form
 // of forceleave
 func (s *Serf) RemoveFailedNode(node string) error {
@@ -818,6 +878,10 @@ func (s *Serf) RemoveFailedNodePrune(node string) error {
 // This also has the effect that Serf will no longer attempt to reconnect
 // to this node.
 func (s *Serf) forceLeave(node string, prune bool) error {
+	if err := s.requireAlive("force leave"); err != nil {
+		return err
+	}
+
 	// Construct the message to broadcast
 	msg := messageLeave{
 		LTime: s.clock.Time(),
@@ -857,35 +921,47 @@ func (s *Serf) forceLeave(node string, prune bool) error {
 // to Leave. Otherwise, other nodes in the cluster will detect this node's
 // exit as a node failure.
 //
-// It is safe to call this method multiple times.
+// It is safe to call this method multiple times. Repeated calls return the
+// result of the first shutdown so every caller observes the same outcome.
 func (s *Serf) Shutdown() error {
 	s.stateLock.Lock()
 	defer s.stateLock.Unlock()
 
+	// Idempotent: once shutdown has run there is nothing left to do, and
+	// every caller must see the same result, including any earlier error.
 	if s.state == SerfShutdown {
-		return nil
+		return s.shutdownErr
 	}
 
 	if s.state != SerfLeft {
 		s.logger.Printf("[WARN] serf: Shutdown without a Leave")
 	}
 
-	// Wait to close the shutdown channel until after we've shut down the
-	// memberlist and its associated network resources, since the shutdown
-	// channel signals that we are cleaned up outside of Serf.
+	// Mark the shutdown before tearing anything down. Holding stateLock for
+	// the whole sequence means Leave, Join, SetTags and forceLeave cannot
+	// slip a configuration change in between the memberlist shutdown and
+	// the final snapshot commit.
 	s.state = SerfShutdown
+
+	// Shut the memberlist down first; this closes shutdownCh only after the
+	// transport and network resources are gone.
 	err := s.memberlist.Shutdown()
 	if err != nil {
-		return err
+		// Record the failure but still finish the snapshot commit so a
+		// transient memberlist error cannot strand an un-persisted member
+		// set. Repeated Shutdown calls keep returning this error.
+		s.shutdownErr = err
 	}
 	close(s.shutdownCh)
 
-	// Wait for the snapshoter to finish if we have one
+	// Wait for the snapshotter to finish its single final commit. The
+	// committed contents reflect whether Leave ran first, but the commit
+	// itself executes exactly once regardless of how shutdown was reached.
 	if s.snapshotter != nil {
 		s.snapshotter.Wait()
 	}
 
-	return nil
+	return s.shutdownErr
 }
 
 // ShutdownCh returns a channel that can be used to wait for
@@ -1097,8 +1173,13 @@ func (s *Serf) handleNodeUpdate(n *memberlist.Node) {
 
 // handleNodeLeaveIntent is called when an intent to leave is received.
 func (s *Serf) handleNodeLeaveIntent(leaveMsg *messageLeave) bool {
-	state := s.State()
+	return s.handleNodeLeaveIntentWithState(leaveMsg, s.State())
+}
 
+// handleNodeLeaveIntentWithState is the lock-aware core of
+// handleNodeLeaveIntent. Callers that already hold stateLock pass the state
+// in directly to avoid re-locking the non-reentrant mutex.
+func (s *Serf) handleNodeLeaveIntentWithState(leaveMsg *messageLeave, state SerfState) bool {
 	// Witness a potentially newer time
 	s.clock.Witness(leaveMsg.LTime)
 
