@@ -75,8 +75,10 @@ type Serf struct {
 
 	// recentIntents the lamport time and type of intent for a given node in
 	// case we get an intent before the relevant memberlist event. This is
-	// indexed by node, and always store the latest lamport time / intent
-	// we've seen. The memberLock protects this structure.
+	// indexed by node, and always stores the latest intent we've seen,
+	// merged generation-aware: an intent bound to an older member
+	// generation never replaces one bound to a newer generation. The
+	// memberLock protects this structure.
 	recentIntents map[string]nodeIntent
 
 	eventBroadcasts *memberlist.TransmitLimitedQueue
@@ -195,6 +197,15 @@ type nodeIntent struct {
 	// Type is the intent being tracked. Only messageJoinType and
 	// messageLeaveType are tracked.
 	Type messageType
+
+	// Gen is the member generation this intent is bound to. A join intent
+	// defines a new generation and carries its own Lamport time here. A
+	// leave intent carries the generation of the instance it removes, or
+	// its own Lamport time when that generation is not known locally.
+	// Intents from an older generation never supersede intents from a
+	// newer one, so a stale delete cannot remove a later same-name
+	// instance.
+	Gen LamportTime
 
 	// WallTime is the wall clock time we saw this intent in order to
 	// expire it from the buffer.
@@ -1030,6 +1041,11 @@ func (s *Serf) handleNodeLeave(n *memberlist.Node) {
 		return
 	}
 
+	// The departing instance's buffered intents are no longer relevant.
+	// Clear them, scoped to its generation: an intent recorded for a later
+	// same-name instance (a newer join we have already seen) must survive.
+	clearIntent(s.recentIntents, n.Name, member.statusLTime)
+
 	// Send an event along
 	event := EventMemberLeave
 	eventStr := "EventMemberLeave"
@@ -1545,6 +1561,10 @@ func (s *Serf) eraseNode(m *memberState) {
 	// Delete from members
 	delete(s.members, m.Name)
 
+	// Delete any buffered intents bound to the erased instance's
+	// generation, keeping the records of a later same-name instance.
+	clearIntent(s.recentIntents, m.Name, m.statusLTime)
+
 	// Tell the coordinate client the node has gone away and delete
 	// its cached coordinates.
 	if !s.config.DisableCoordinates {
@@ -1737,23 +1757,78 @@ func reapIntents(intents map[string]nodeIntent, now time.Time, timeout time.Dura
 	}
 }
 
+// intentSupersedes reports whether intent a should replace intent b under
+// the deterministic merge priority: a newer member generation always wins,
+// within one generation the higher Lamport time wins, and a leave breaks a
+// tie against a join so a delete is not lost to a concurrent join of the
+// same generation.
+func intentSupersedes(a, b nodeIntent) bool {
+	if a.Gen != b.Gen {
+		return a.Gen > b.Gen
+	}
+	if a.LTime != b.LTime {
+		return a.LTime > b.LTime
+	}
+	return a.Type == messageLeaveType && b.Type != messageLeaveType
+}
+
+// mergeIntent merges an intent for a node into the buffer, binding it to the
+// given member generation. Conflicts are resolved with the deterministic
+// priority of intentSupersedes, so every node converges on the same entry
+// regardless of delivery order. It returns the winning intent, which is the
+// entry stored after the merge, and whether the stored entry changed, so
+// callers observe a consistent result either way. Make sure the memberLock
+// is held when passing in the Serf instance's recentIntents member.
+func mergeIntent(intents map[string]nodeIntent, node string, itype messageType,
+	gen, ltime LamportTime, stamper func() time.Time) (nodeIntent, bool) {
+	next := nodeIntent{
+		Type:  itype,
+		Gen:   gen,
+		LTime: ltime,
+	}
+	cur, ok := intents[node]
+	if !ok || intentSupersedes(next, cur) {
+		next.WallTime = stamper()
+		intents[node] = next
+		return next, true
+	}
+
+	return cur, false
+}
+
 // upsertIntent will update an existing intent with the supplied Lamport time,
 // or create a new entry. This will return true if a new entry was added. The
 // stamper is used to capture the wall clock time for expiring these buffered
 // intents. Make sure the memberLock is held when passing in the Serf instance's
 // recentIntents member.
+//
+// The intent is bound to a member generation before merging: a join defines
+// its own generation, while a leave is bound to the generation of a buffered
+// join it postdates. A leave whose target generation is not known locally is
+// bound to its own Lamport time, which preserves the legacy Lamport ordering
+// against intents of other generations.
 func upsertIntent(intents map[string]nodeIntent, node string, itype messageType,
 	ltime LamportTime, stamper func() time.Time) bool {
-	if intent, ok := intents[node]; !ok || ltime > intent.LTime {
-		intents[node] = nodeIntent{
-			Type:     itype,
-			WallTime: stamper(),
-			LTime:    ltime,
+	gen := ltime
+	if itype == messageLeaveType {
+		if cur, ok := intents[node]; ok && cur.Type == messageJoinType && cur.LTime < ltime {
+			gen = cur.Gen
 		}
-		return true
 	}
+	_, changed := mergeIntent(intents, node, itype, gen, ltime, stamper)
+	return changed
+}
 
-	return false
+// clearIntent removes a buffered intent for a node when the instance it
+// refers to has departed. The removal is generation-scoped: an entry is only
+// dropped if it is bound to a generation at or below the departing
+// instance's Lamport time, so the records of a later same-name instance are
+// left untouched. Make sure the memberLock is held when passing in the Serf
+// instance's recentIntents member.
+func clearIntent(intents map[string]nodeIntent, node string, gen LamportTime) {
+	if intent, ok := intents[node]; ok && intent.Gen <= gen {
+		delete(intents, node)
+	}
 }
 
 // recentIntent checks the recent intent buffer for a matching entry for a given

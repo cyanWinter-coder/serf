@@ -1591,6 +1591,101 @@ func TestRecentIntent(t *testing.T) {
 	}
 }
 
+func TestMergeIntent_sameNameReplacement(t *testing.T) {
+	intents := make(map[string]nodeIntent)
+
+	// The original instance of the node leaves; the delete is buffered
+	// against its generation.
+	winner, changed := mergeIntent(intents, "web", messageLeaveType, 5, 10, time.Now)
+	if !changed || winner.Type != messageLeaveType || winner.Gen != 5 || winner.LTime != 10 {
+		t.Fatalf("bad merge: %v %v", changed, winner)
+	}
+
+	// A new instance of the same name joins with a newer generation; its
+	// join must displace the old delete.
+	winner, changed = mergeIntent(intents, "web", messageJoinType, 12, 12, time.Now)
+	if !changed || winner.Type != messageJoinType || winner.Gen != 12 || winner.LTime != 12 {
+		t.Fatalf("bad merge: %v %v", changed, winner)
+	}
+
+	// A delete bound to the old generation must not remove the new
+	// instance, even with a higher Lamport time.
+	winner, changed = mergeIntent(intents, "web", messageLeaveType, 5, 13, time.Now)
+	if changed || winner.Type != messageJoinType || winner.Gen != 12 {
+		t.Fatalf("old generation delete must not win: %v %v", changed, winner)
+	}
+
+	// A delete bound to the current generation still applies.
+	winner, changed = mergeIntent(intents, "web", messageLeaveType, 12, 14, time.Now)
+	if !changed || winner.Type != messageLeaveType || winner.Gen != 12 || winner.LTime != 14 {
+		t.Fatalf("bad merge: %v %v", changed, winner)
+	}
+}
+
+func TestMergeIntent_duplicateMerge(t *testing.T) {
+	intents := make(map[string]nodeIntent)
+
+	if _, changed := mergeIntent(intents, "web", messageJoinType, 8, 8, time.Now); !changed {
+		t.Fatalf("should have added")
+	}
+	before := intents["web"]
+
+	// Merging the identical intent again is a no-op and must not touch the
+	// stored entry, including its expiry timestamp.
+	winner, changed := mergeIntent(intents, "web", messageJoinType, 8, 8, func() time.Time {
+		return time.Now().Add(time.Hour)
+	})
+	if changed {
+		t.Fatalf("duplicate merge should not change the entry")
+	}
+	if winner != before || intents["web"] != before {
+		t.Fatalf("duplicate merge altered the entry: %v != %v", winner, before)
+	}
+
+	// A same-generation, same-time leave deterministically beats the join,
+	// regardless of the order the two are merged in.
+	a := make(map[string]nodeIntent)
+	b := make(map[string]nodeIntent)
+	mergeIntent(a, "web", messageJoinType, 8, 8, time.Now)
+	mergeIntent(a, "web", messageLeaveType, 8, 8, time.Now)
+	mergeIntent(b, "web", messageLeaveType, 8, 8, time.Now)
+	mergeIntent(b, "web", messageJoinType, 8, 8, time.Now)
+	if a["web"].Type != messageLeaveType || b["web"].Type != messageLeaveType {
+		t.Fatalf("merge order changed the winner: %v / %v", a["web"], b["web"])
+	}
+}
+
+func TestClearIntent_leave(t *testing.T) {
+	intents := make(map[string]nodeIntent)
+
+	// Intents bound to the departing instances.
+	mergeIntent(intents, "old", messageJoinType, 5, 5, time.Now)
+	mergeIntent(intents, "gone", messageLeaveType, 5, 10, time.Now)
+
+	// A later same-name instance has already announced itself with a newer
+	// generation.
+	mergeIntent(intents, "back", messageJoinType, 5, 5, time.Now)
+	mergeIntent(intents, "back", messageJoinType, 12, 12, time.Now)
+
+	clearIntent(intents, "old", 5)
+	clearIntent(intents, "gone", 10)
+	// The old instance of "back" departs; the new instance's record stays.
+	clearIntent(intents, "back", 5)
+	// An unknown node is a no-op.
+	clearIntent(intents, "tubez", 99)
+
+	if _, ok := intents["old"]; ok {
+		t.Fatalf("should be cleared")
+	}
+	if _, ok := intents["gone"]; ok {
+		t.Fatalf("should be cleared")
+	}
+	intent, ok := intents["back"]
+	if !ok || intent.Gen != 12 || intent.Type != messageJoinType {
+		t.Fatalf("later same-name instance record must survive: %v %v", ok, intent)
+	}
+}
+
 func TestMemberStatus_String(t *testing.T) {
 	status := []MemberStatus{StatusNone, StatusAlive, StatusLeaving, StatusLeft, StatusFailed}
 	expect := []string{"none", "alive", "leaving", "left", "failed"}

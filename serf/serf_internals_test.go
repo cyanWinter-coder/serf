@@ -345,6 +345,90 @@ func TestSerf_joinIntent_resetLeaving(t *testing.T) {
 	}
 }
 
+func TestSerf_joinIntent_displacesStaleLeave(t *testing.T) {
+	ip1, returnFn1 := testutil.TakeIP()
+	defer returnFn1()
+
+	c := testConfig(t, ip1)
+	s, err := Create(c)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	defer s.Shutdown()
+
+	// A stale delete intent for an old instance of the node is buffered.
+	mergeIntent(s.recentIntents, "test", messageLeaveType, 5, 10, time.Now)
+
+	// The new instance's join intent arrives before the memberlist event.
+	j := messageJoin{LTime: 12, Node: "test"}
+	if !s.handleNodeJoinIntent(&j) {
+		t.Fatalf("should rebroadcast")
+	}
+
+	// The stale delete must be displaced by the newer generation.
+	if _, ok := recentIntent(s.recentIntents, "test", messageLeaveType); ok {
+		t.Fatalf("stale leave should be displaced")
+	}
+	if join, ok := recentIntent(s.recentIntents, "test", messageJoinType); !ok || join != 12 {
+		t.Fatalf("bad buffer")
+	}
+
+	// A delete bound to the old generation must not remove the new
+	// instance.
+	l := messageLeave{LTime: 11, Node: "test"}
+	if s.handleNodeLeaveIntent(&l) {
+		t.Fatalf("old generation delete should not be rebroadcast")
+	}
+	if _, ok := recentIntent(s.recentIntents, "test", messageLeaveType); ok {
+		t.Fatalf("old generation delete should not be buffered")
+	}
+	if join, ok := recentIntent(s.recentIntents, "test", messageJoinType); !ok || join != 12 {
+		t.Fatalf("new instance join should survive")
+	}
+}
+
+func TestSerf_leave_clearsPendingIntents(t *testing.T) {
+	ip1, returnFn1 := testutil.TakeIP()
+	defer returnFn1()
+
+	c := testConfig(t, ip1)
+	s, err := Create(c)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	defer s.Shutdown()
+
+	// A buffered intent bound to the departing instance's generation is
+	// cleared when the node leaves.
+	upsertIntent(s.recentIntents, "old", messageJoinType, 5, time.Now)
+	s.members["old"] = &memberState{
+		Member: Member{
+			Name:   "old",
+			Status: StatusLeaving,
+		},
+		statusLTime: 10,
+	}
+	s.handleNodeLeave(&memberlist.Node{Name: "old"})
+	if _, ok := recentIntent(s.recentIntents, "old", messageJoinType); ok {
+		t.Fatalf("departing instance intent should be cleared")
+	}
+
+	// A buffered intent bound to a later same-name instance survives the
+	// departure of the old instance.
+	mergeIntent(s.recentIntents, "back", messageJoinType, 12, 12, time.Now)
+	s.members["back"] = &memberState{
+		Member: Member{
+			Name:   "back",
+			Status: StatusLeaving,
+		},
+		statusLTime: 10,
+	}
+	s.handleNodeLeave(&memberlist.Node{Name: "back"})
+	if join, ok := recentIntent(s.recentIntents, "back", messageJoinType); !ok || join != 12 {
+		t.Fatalf("later same-name instance intent should survive")
+	}
+}
+
 func TestSerf_userEvent_oldMessage(t *testing.T) {
 	ip1, returnFn1 := testutil.TakeIP()
 	defer returnFn1()
