@@ -49,16 +49,18 @@ const (
 // messageJoin is the message broadcasted after we join to
 // associated the node with a lamport clock
 type messageJoin struct {
-	LTime LamportTime
-	Node  string
+	LTime      LamportTime
+	Node       string
+	Generation Generation
 }
 
 // messageLeave is the message broadcasted to signal the intentional to
 // leave.
 type messageLeave struct {
-	LTime LamportTime
-	Node  string
-	Prune bool
+	LTime      LamportTime
+	Node       string
+	Prune      bool
+	Generation Generation
 }
 
 // messagePushPullType is used when doing a state exchange. This

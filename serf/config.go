@@ -33,6 +33,13 @@ type Config struct {
 	// is not set, Serf will set it to the hostname of the running machine.
 	NodeName string
 
+	// Generation is the instance generation of this named node. A process
+	// restart that reuses NodeName and its address should use a new, larger
+	// generation. When zero, Create allocates a fresh process-monotonic
+	// generation. Pin a non-zero value in tests or when an external system
+	// assigns fencing tokens.
+	Generation uint64
+
 	// The tags for this role, if any. This is used to provide arbitrary
 	// key/value metadata per-node. For example, a "role" tag may be used to
 	// differentiate "load-balancer" from a "web" role as parts of the same cluster.

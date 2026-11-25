@@ -67,6 +67,7 @@ type Serf struct {
 
 	broadcasts    *memberlist.TransmitLimitedQueue
 	config        *Config
+	generation    Generation
 	failedMembers []*memberState
 	leftMembers   []*memberState
 	memberlist    *memberlist.Memberlist
@@ -78,6 +79,20 @@ type Serf struct {
 	// indexed by node, and always store the latest lamport time / intent
 	// we've seen. The memberLock protects this structure.
 	recentIntents map[string]nodeIntent
+
+	// generations fences successive instances of the same node name and
+	// owns generation-scoped transition deduplication and runtime cleanup.
+	// It is lazily initialized so focused unit tests can still construct a
+	// minimal Serf value.
+	generationsOnce sync.Once
+	generations     *GenerationManager
+
+	// pruneTimers contains cancellable forced-prune timers keyed by member
+	// identity. pruneTimersLock protects the map; memberLock may be held
+	// while replacing a timer, but timer callbacks never hold pruneTimersLock
+	// while taking memberLock.
+	pruneTimersLock sync.Mutex
+	pruneTimers     map[string]*time.Timer
 
 	eventBroadcasts *memberlist.TransmitLimitedQueue
 	eventBuffer     []*userEvents
@@ -136,7 +151,13 @@ func (s SerfState) String() string {
 
 // Member is a single member of the Serf cluster.
 type Member struct {
-	Name   string
+	Name string
+
+	// Generation identifies the particular instance of the named node. It
+	// is not derived from Addr/Port: a fast restart may reuse the same
+	// transport address with a new Generation.
+	Generation Generation
+
 	Addr   net.IP
 	Port   uint16
 	Tags   map[string]string
@@ -162,6 +183,11 @@ const (
 	StatusLeaving
 	StatusLeft
 	StatusFailed
+
+	// StatusSuspect is used by generation-aware transition bookkeeping.
+	// Ordinary Serf member events continue to use Alive, Leaving, Left and
+	// Failed; suspect is normally an internal memberlist state.
+	StatusSuspect
 )
 
 func (s MemberStatus) String() string {
@@ -176,6 +202,8 @@ func (s MemberStatus) String() string {
 		return "left"
 	case StatusFailed:
 		return "failed"
+	case StatusSuspect:
+		return "suspect"
 	default:
 		panic(fmt.Sprintf("unknown MemberStatus: %d", s))
 	}
@@ -190,11 +218,21 @@ type memberState struct {
 	leaveTime   time.Time   // wall clock time of leave
 }
 
+// Identity returns the name and instance generation of the member.
+func (m Member) Identity() MemberIdentity {
+	return MemberIdentity{Name: m.Name, Generation: m.Generation}
+}
+
 // nodeIntent is used to buffer intents for out-of-order deliveries.
 type nodeIntent struct {
 	// Type is the intent being tracked. Only messageJoinType and
 	// messageLeaveType are tracked.
 	Type messageType
+
+	// Generation is the member instance this intent is bound to. Zero means
+	// the message came from an older caller that does not carry an instance
+	// generation; those intents retain the legacy Lamport-time ordering.
+	Generation Generation
 
 	// WallTime is the wall clock time we saw this intent in order to
 	// expire it from the buffer.
@@ -271,8 +309,20 @@ func Create(conf *Config) (*Serf, error) {
 		state:                   SerfAlive,
 		metricLabels:            conf.MetricLabels,
 		msgpackUseNewTimeFormat: conf.MsgpackUseNewTimeFormat,
+		generations:             NewGenerationManager(),
+		pruneTimers:             make(map[string]*time.Timer),
 	}
 	serf.eventJoinIgnore.Store(false)
+
+	// Every Create is a member instance. Callers may pin the generation for
+	// deterministic restarts/tests; otherwise allocate a fresh monotonic one.
+	// Do not write the allocated value back to Config: reusing a zero-value
+	// Config to restart the process must allocate a distinct generation.
+	serf.generation = conf.Generation
+	if serf.generation == 0 {
+		serf.generation = nextInstanceGeneration(time.Now())
+	}
+	serf.generations.Join(serf.LocalIdentity())
 
 	// Check that the meta data length is okay
 	if len(serf.encodeTags(conf.Tags)) > memberlist.MetaMaxSize {
@@ -672,8 +722,9 @@ func (s *Serf) Join(existing []string, ignoreOld bool) (int, error) {
 func (s *Serf) broadcastJoin(ltime LamportTime) error {
 	// Construct message to update our lamport clock
 	msg := messageJoin{
-		LTime: ltime,
-		Node:  s.config.NodeName,
+		LTime:      ltime,
+		Node:       s.config.NodeName,
+		Generation: s.generation,
 	}
 	s.clock.Witness(ltime)
 
@@ -717,8 +768,9 @@ func (s *Serf) Leave() error {
 
 	// Construct the message for the graceful leave
 	msg := messageLeave{
-		LTime: s.clock.Time(),
-		Node:  s.config.NodeName,
+		LTime:      s.clock.Time(),
+		Node:       s.config.NodeName,
+		Generation: s.generation,
 	}
 	s.clock.Increment()
 
@@ -787,7 +839,11 @@ func (s *Serf) hasAliveMembers() bool {
 func (s *Serf) LocalMember() Member {
 	s.memberLock.RLock()
 	defer s.memberLock.RUnlock()
-	return s.members[s.config.NodeName].Member
+	member := s.members[s.config.NodeName].Member
+	if member.Generation == 0 {
+		member.Generation = s.generation
+	}
+	return member
 }
 
 // Members returns a point-in-time snapshot of the members of this cluster.
@@ -797,7 +853,11 @@ func (s *Serf) Members() []Member {
 
 	members := make([]Member, 0, len(s.members))
 	for _, m := range s.members {
-		members = append(members, m.Member)
+		member := m.Member
+		if member.Generation == 0 && member.Name == s.config.NodeName {
+			member.Generation = s.generation
+		}
+		members = append(members, member)
 	}
 
 	return members
@@ -818,11 +878,21 @@ func (s *Serf) RemoveFailedNodePrune(node string) error {
 // This also has the effect that Serf will no longer attempt to reconnect
 // to this node.
 func (s *Serf) forceLeave(node string, prune bool) error {
-	// Construct the message to broadcast
+	// Construct the message to broadcast. Bound it to the generation we
+	// currently believe this name represents so stale instances cannot act
+	// on a removal intended for a newer one.
+	s.memberLock.RLock()
+	targetGeneration := Generation(0)
+	if m, ok := s.members[node]; ok {
+		targetGeneration = m.Generation
+	}
+	s.memberLock.RUnlock()
+
 	msg := messageLeave{
-		LTime: s.clock.Time(),
-		Node:  node,
-		Prune: prune,
+		LTime:      s.clock.Time(),
+		Node:       node,
+		Prune:      prune,
+		Generation: targetGeneration,
 	}
 	s.clock.Increment()
 
@@ -874,6 +944,8 @@ func (s *Serf) Shutdown() error {
 	// memberlist and its associated network resources, since the shutdown
 	// channel signals that we are cleaned up outside of Serf.
 	s.state = SerfShutdown
+	s.stopAllPruneTimers()
+	s.generationManager().Close()
 	err := s.memberlist.Shutdown()
 	if err != nil {
 		return err
@@ -906,6 +978,87 @@ func (s *Serf) State() SerfState {
 	return s.state
 }
 
+// generationManager returns the generation registry, lazily creating it for
+// Serf values assembled directly in unit tests.
+func (s *Serf) generationManager() *GenerationManager {
+	s.generationsOnce.Do(func() {
+		if s.generations == nil {
+			s.generations = NewGenerationManager()
+		}
+	})
+	return s.generations
+}
+
+// Generation returns the instance generation of this local Serf node.
+func (s *Serf) Generation() Generation {
+	return s.generation
+}
+
+// LocalIdentity returns the name and instance generation of this local node.
+func (s *Serf) LocalIdentity() MemberIdentity {
+	return MemberIdentity{Name: s.config.NodeName, Generation: s.generation}
+}
+
+// MemberGeneration returns the generation currently tracked for a named
+// member.
+func (s *Serf) MemberGeneration(name string) (Generation, bool) {
+	s.memberLock.RLock()
+	defer s.memberLock.RUnlock()
+
+	m, ok := s.members[name]
+	if !ok {
+		g, ok := s.generationManager().CurrentGeneration(name)
+		return g, ok
+	}
+	return m.Generation, true
+}
+
+// CommitTransition records a generation/sequence-ordered member transition.
+// It returns true only for the first valid commit of that transition.
+func (s *Serf) CommitTransition(t Transition) bool {
+	return s.generationManager().Commit(t)
+}
+
+// HandleAlive commits an alive transition for an identity.
+func (s *Serf) HandleAlive(id MemberIdentity, sequence Sequence) bool {
+	return s.generationManager().CommitAlive(id, sequence)
+}
+
+// HandleSuspect commits a suspect transition for an identity.
+func (s *Serf) HandleSuspect(id MemberIdentity, sequence Sequence) bool {
+	return s.generationManager().CommitSuspect(id, sequence)
+}
+
+// HandleDead commits a dead transition for an identity.
+func (s *Serf) HandleDead(id MemberIdentity, sequence Sequence) bool {
+	return s.generationManager().CommitDead(id, sequence)
+}
+
+// StartDetection starts a generation-scoped detection timer.
+func (s *Serf) StartDetection(id MemberIdentity, timeout time.Duration, fn func()) {
+	s.generationManager().StartDetection(id, timeout, fn)
+}
+
+// CancelDetection cancels a generation-scoped detection timer.
+func (s *Serf) CancelDetection(id MemberIdentity) bool {
+	return s.generationManager().CancelDetection(id)
+}
+
+// EnqueueRetransmit stores a generation-scoped retransmission item.
+func (s *Serf) EnqueueRetransmit(id MemberIdentity, sequence Sequence, msg []byte) bool {
+	return s.generationManager().EnqueueRetransmit(id, sequence, msg)
+}
+
+// RetransmitQueue returns the generation-scoped retransmission queue.
+func (s *Serf) RetransmitQueue(id MemberIdentity) *RetransmitQueue {
+	return s.generationManager().RetransmitQueue(id)
+}
+
+// ClearRetransmit removes a generation-scoped retransmission queue.
+func (s *Serf) ClearRetransmit(id MemberIdentity) {
+	s.generationManager().ClearRetransmit(id)
+}
+
 // broadcast takes a Serf message type, encodes it for the wire, and queues
 // the broadcast. If a notify channel is given, this channel will be closed
 // when the broadcast is sent.
@@ -934,15 +1087,33 @@ func (s *Serf) handleNodeJoin(n *memberlist.Node) {
 
 	var oldStatus MemberStatus
 	member, ok := s.members[n.Name]
+
+	// Serf intents may arrive before the matching memberlist event. Their
+	// generation tells us which instance this event belongs to.
+	pendingGeneration := Generation(0)
+	if intent, ok := s.recentIntents[n.Name]; ok {
+		pendingGeneration = intent.Generation
+	}
+	if n.Name == s.config.NodeName && pendingGeneration == 0 {
+		pendingGeneration = s.generation
+	}
+	if ok && pendingGeneration != 0 && member.Generation != 0 &&
+		pendingGeneration < member.Generation {
+		s.logger.Printf("[DEBUG] serf: ignoring join event for stale generation %s@%d (current %d)",
+			n.Name, pendingGeneration, member.Generation)
+		return
+	}
+
 	if !ok {
 		oldStatus = StatusNone
 		member = &memberState{
 			Member: Member{
-				Name:   n.Name,
-				Addr:   n.Addr,
-				Port:   n.Port,
-				Tags:   s.decodeTags(n.Meta),
-				Status: StatusAlive,
+				Name:       n.Name,
+				Generation: pendingGeneration,
+				Addr:       n.Addr,
+				Port:       n.Port,
+				Tags:       s.decodeTags(n.Meta),
+				Status:     StatusAlive,
 			},
 		}
 
@@ -967,9 +1138,19 @@ func (s *Serf) handleNodeJoin(n *memberlist.Node) {
 
 		member.Status = StatusAlive
 		member.leaveTime = time.Time{}
+		if pendingGeneration != 0 && pendingGeneration > member.Generation {
+			member.Generation = pendingGeneration
+		}
 		member.Addr = n.Addr
 		member.Port = n.Port
 		member.Tags = s.decodeTags(n.Meta)
+	}
+
+	identity := MemberIdentity{Name: member.Name, Generation: member.Generation}
+	if n.Addr != nil {
+		s.generationManager().JoinWithAddress(identity, n.Address())
+	} else {
+		s.generationManager().Join(identity)
 	}
 
 	// Update the protocol versions every time we get an event
@@ -1014,6 +1195,13 @@ func (s *Serf) handleNodeLeave(n *memberlist.Node) {
 		// leaving. Just ignore it completely.
 		return
 	}
+
+	// The instance has reached a terminal memberlist transition. Its
+	// failure-detection timer and generation-scoped retransmission queue
+	// must not survive it. Buffered intents for this generation are likewise
+	// irrelevant; a newer same-name generation retains its own records.
+	s.generationManager().CleanupIdentity(member.Identity())
+	clearIntent(s.recentIntents, n.Name, member.Generation)
 
 	switch member.Status {
 	case StatusLeaving:
@@ -1107,8 +1295,33 @@ func (s *Serf) handleNodeLeaveIntent(leaveMsg *messageLeave) bool {
 
 	member, ok := s.members[leaveMsg.Node]
 	if !ok {
+		gen := leaveMsg.Generation
+		if gen == 0 {
+			// A legacy leave may post-date a buffered join that identifies
+			// its generation. Bind to that generation when possible.
+			if intent, ok := s.recentIntents[leaveMsg.Node]; ok &&
+				intent.Type == messageJoinType && intent.LTime < leaveMsg.LTime {
+				gen = intent.Generation
+			}
+		}
+
 		// Rebroadcast only if this was an update we hadn't seen before.
-		return upsertIntent(s.recentIntents, leaveMsg.Node, messageLeaveType, leaveMsg.LTime, time.Now)
+		_, changed := mergeIntent(s.recentIntents, leaveMsg.Node, messageLeaveType,
+			gen, leaveMsg.LTime, time.Now)
+		return changed
+	}
+
+	// Generation fences first. A leave from an old instance can never remove
+	// a newer same-name instance, even if its Lamport time is higher.
+	if leaveMsg.Generation != 0 && member.Generation != 0 {
+		if leaveMsg.Generation < member.Generation {
+			return false
+		}
+		if leaveMsg.Generation > member.Generation {
+			_, changed := mergeIntent(s.recentIntents, leaveMsg.Node, messageLeaveType,
+				leaveMsg.Generation, leaveMsg.LTime, time.Now)
+			return changed
+		}
 	}
 
 	// If the message is old, then it is irrelevant and we can skip it
@@ -1190,27 +1403,33 @@ func (s *Serf) handleNodeLeaveIntent(leaveMsg *messageLeave) bool {
 
 // handlePrune waits for nodes that are leaving and then forcibly
 // erases a member from the list of members. This function is called
-// while the caller holds memberLock, but spawns a goroutine to avoid
-// blocking while sleeping.
+// while the caller holds memberLock, but uses a cancellable timer so a
+// restarted same-name generation or an explicit erase can cancel the work.
 func (s *Serf) handlePrune(member *memberState) {
+	identity := member.Identity()
 	memberName := member.Name
 	memberAddr := member.Addr
 	memberStatus := member.Status
 
-	go func() {
-		if memberStatus == StatusLeaving {
-			time.Sleep(s.config.BroadcastTimeout + s.config.LeavePropagateDelay)
-		}
+	delay := time.Duration(0)
+	if memberStatus == StatusLeaving {
+		delay = s.config.BroadcastTimeout + s.config.LeavePropagateDelay
+	}
 
+	var timer *time.Timer
+	timer = time.AfterFunc(delay, func() {
 		s.logger.Printf("[INFO] serf: EventMemberReap (forced): %s %s", memberName, memberAddr)
 
 		// Acquire lock to safely modify member state
 		s.memberLock.Lock()
 		defer s.memberLock.Unlock()
+		s.unregisterPruneTimer(identity.key(), timer)
 
-		// Verify the member still exists and should be erased
+		// Verify the exact instance still exists and should be erased. A
+		// new generation reusing the name must not be reaped by the old
+		// instance's prune timer.
 		m, ok := s.members[memberName]
-		if !ok {
+		if !ok || m.Generation != identity.Generation {
 			return
 		}
 
@@ -1219,7 +1438,60 @@ func (s *Serf) handlePrune(member *memberState) {
 			s.leftMembers = removeOldMember(s.leftMembers, memberName)
 		}
 		s.eraseNode(m)
-	}()
+	})
+	s.registerPruneTimer(identity.key(), timer)
+}
+
+// registerPruneTimer records a prune timer, stopping and replacing any prior
+// timer for the same identity.
+func (s *Serf) registerPruneTimer(key string, timer *time.Timer) {
+	s.pruneTimersLock.Lock()
+	defer s.pruneTimersLock.Unlock()
+	if s.pruneTimers == nil {
+		s.pruneTimers = make(map[string]*time.Timer)
+	}
+	if old := s.pruneTimers[key]; old != nil {
+		old.Stop()
+	}
+	s.pruneTimers[key] = timer
+}
+
+// unregisterPruneTimer removes a fired timer only when the map still points to
+// it.
+func (s *Serf) unregisterPruneTimer(key string, timer *time.Timer) {
+	s.pruneTimersLock.Lock()
+	defer s.pruneTimersLock.Unlock()
+	if current, ok := s.pruneTimers[key]; ok && current == timer {
+		delete(s.pruneTimers, key)
+	}
+}
+
+// hasPruneTimer reports whether a prune timer is registered.
+func (s *Serf) hasPruneTimer(key string) bool {
+	s.pruneTimersLock.Lock()
+	defer s.pruneTimersLock.Unlock()
+	_, ok := s.pruneTimers[key]
+	return ok
+}
+
+// stopPruneTimer cancels the prune timer for one identity.
+func (s *Serf) stopPruneTimer(key string) {
+	s.pruneTimersLock.Lock()
+	defer s.pruneTimersLock.Unlock()
+	if timer, ok := s.pruneTimers[key]; ok {
+		timer.Stop()
+		delete(s.pruneTimers, key)
+	}
+}
+
+// stopAllPruneTimers cancels every pending prune timer.
+func (s *Serf) stopAllPruneTimers() {
+	s.pruneTimersLock.Lock()
+	defer s.pruneTimersLock.Unlock()
+	for key, timer := range s.pruneTimers {
+		timer.Stop()
+		delete(s.pruneTimers, key)
+	}
 }
 
 // handleNodeJoinIntent is called when a node broadcasts a
@@ -1234,16 +1506,51 @@ func (s *Serf) handleNodeJoinIntent(joinMsg *messageJoin) bool {
 	member, ok := s.members[joinMsg.Node]
 	if !ok {
 		// Rebroadcast only if this was an update we hadn't seen before.
-		return upsertIntent(s.recentIntents, joinMsg.Node, messageJoinType, joinMsg.LTime, time.Now)
+		_, changed := mergeIntent(s.recentIntents, joinMsg.Node, messageJoinType,
+			joinMsg.Generation, joinMsg.LTime, time.Now)
+		return changed
 	}
 
-	// Check if this time is newer than what we have
-	if joinMsg.LTime <= member.statusLTime {
+	generationNewer := joinMsg.Generation != 0 && member.Generation != 0 &&
+		joinMsg.Generation > member.Generation
+	generationOlder := joinMsg.Generation != 0 && member.Generation != 0 &&
+		joinMsg.Generation < member.Generation
+
+	// An old instance must not be able to drive the new instance backwards.
+	if generationOlder {
 		return false
 	}
 
-	// Update the LTime
-	member.statusLTime = joinMsg.LTime
+	// Within one generation the Lamport time provides the ordering. A newer
+	// generation supersedes an older one even if its first Lamport time is
+	// lower (for example after a clock reset).
+	if !generationNewer && joinMsg.LTime <= member.statusLTime {
+		return false
+	}
+
+	if generationNewer {
+		oldIdentity := member.Identity()
+		newIdentity := MemberIdentity{Name: member.Name, Generation: joinMsg.Generation}
+
+		// Any timer or queue left from the old instance belongs to that
+		// instance and must not fire after the replacement joins.
+		s.stopPruneTimer(oldIdentity.key())
+		if member.Addr != nil {
+			address := net.JoinHostPort(member.Addr.String(), strconv.Itoa(int(member.Port)))
+			s.generationManager().Restart(newIdentity, address)
+		} else {
+			s.generationManager().Join(newIdentity)
+			s.generationManager().CleanupIdentity(oldIdentity)
+		}
+		member.Generation = joinMsg.Generation
+	} else {
+		s.generationManager().Join(member.Identity())
+	}
+
+	// Update the LTime without moving backwards across a generation reset.
+	if joinMsg.LTime > member.statusLTime {
+		member.statusLTime = joinMsg.LTime
+	}
 
 	// If we are in the leaving state, we should go back to alive,
 	// since the leaving message must have been for an older time
@@ -1542,6 +1849,20 @@ func (s *Serf) resolveNodeConflict() {
 
 // eraseNode takes a node completely out of the member list
 func (s *Serf) eraseNode(m *memberState) {
+	identity := m.Identity()
+
+	// Cancel any pending forced prune and release detection timers and
+	// retransmission state bound to this exact instance.
+	s.stopPruneTimer(identity.key())
+	s.generationManager().CleanupIdentity(identity)
+	clearIntent(s.recentIntents, m.Name, m.Generation)
+
+	// Remove only this state object from the failure/left indexes. A same-name
+	// new generation may already occupy the maps and must not be removed by
+	// pointer-independent name filtering.
+	s.failedMembers = removeMemberState(s.failedMembers, m)
+	s.leftMembers = removeMemberState(s.leftMembers, m)
+
 	// Delete from members
 	delete(s.members, m.Name)
 
@@ -1726,6 +2047,17 @@ func removeOldMember(old []*memberState, name string) []*memberState {
 	return old
 }
 
+// removeMemberState removes one exact state object. This is generation-safe
+// when a same-name replacement has created a new pointer.
+func removeMemberState(old []*memberState, target *memberState) []*memberState {
+	for i, m := range old {
+		if m == target {
+			return append(old[:i], old[i+1:]...)
+		}
+	}
+	return old
+}
+
 // reapIntents clears out any intents that are older than the timeout. Make sure
 // the memberLock is held when passing in the Serf instance's recentIntents
 // member.
@@ -1737,6 +2069,40 @@ func reapIntents(intents map[string]nodeIntent, now time.Time, timeout time.Dura
 	}
 }
 
+// intentSupersedes reports whether intent a should replace intent b. An
+// explicit newer member generation always wins. Within one generation (or
+// legacy zero generations), the higher Lamport time wins, and a leave breaks
+// an equal-time tie against a join so a delete is not lost.
+func intentSupersedes(a, b nodeIntent) bool {
+	if a.Generation != 0 && b.Generation != 0 && a.Generation != b.Generation {
+		return a.Generation > b.Generation
+	}
+	if a.LTime != b.LTime {
+		return a.LTime > b.LTime
+	}
+	return a.Type == messageLeaveType && b.Type != messageLeaveType
+}
+
+// mergeIntent merges an intent into the buffer using deterministic generation
+// and Lamport-time priority. It returns the stored winner and whether it
+// changed. Make sure memberLock is held for the supplied map.
+func mergeIntent(intents map[string]nodeIntent, node string, itype messageType,
+	generation Generation, ltime LamportTime, stamper func() time.Time) (nodeIntent, bool) {
+	next := nodeIntent{
+		Type:       itype,
+		Generation: generation,
+		LTime:      ltime,
+	}
+
+	current, ok := intents[node]
+	if !ok || intentSupersedes(next, current) {
+		next.WallTime = stamper()
+		intents[node] = next
+		return next, true
+	}
+	return current, false
+}
+
 // upsertIntent will update an existing intent with the supplied Lamport time,
 // or create a new entry. This will return true if a new entry was added. The
 // stamper is used to capture the wall clock time for expiring these buffered
@@ -1744,16 +2110,21 @@ func reapIntents(intents map[string]nodeIntent, now time.Time, timeout time.Dura
 // recentIntents member.
 func upsertIntent(intents map[string]nodeIntent, node string, itype messageType,
 	ltime LamportTime, stamper func() time.Time) bool {
-	if intent, ok := intents[node]; !ok || ltime > intent.LTime {
-		intents[node] = nodeIntent{
-			Type:     itype,
-			WallTime: stamper(),
-			LTime:    ltime,
-		}
-		return true
-	}
+	_, changed := mergeIntent(intents, node, itype, 0, ltime, stamper)
+	return changed
+}
 
-	return false
+// clearIntent removes a buffered intent when it belongs to generation or an
+// older/legacy generation. A record bound to a newer same-name instance is
+// retained. Make sure memberLock is held for the supplied map.
+func clearIntent(intents map[string]nodeIntent, node string, generation Generation) {
+	intent, ok := intents[node]
+	if !ok {
+		return
+	}
+	if generation == 0 || intent.Generation == 0 || intent.Generation <= generation {
+		delete(intents, node)
+	}
 }
 
 // recentIntent checks the recent intent buffer for a matching entry for a given
